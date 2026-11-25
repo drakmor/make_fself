@@ -127,7 +127,7 @@ class ElfPHdr(object):
 	PT_TLS = 0x7
 	PT_GNU_EH_FRAME = 0x6474E550
 	PT_GNU_STACK = 0x6474E551
-	PT_SCE_RELA = 0x60000000,
+	PT_SCE_RELA = 0x60000000
 	PT_SCE_DYNLIBDATA = 0x61000000
 	PT_SCE_PROCPARAM = 0x61000001
 	PT_SCE_MODULE_PARAM = 0x61000002
@@ -255,9 +255,9 @@ class ElfFile(object):
 				shdr = ElfSHdr(i)
 				shdr.load(f)
 				self.shdrs.append(shdr)
-				if phdr.filesz > 0:
+				if shdr.size > 0:
 					f.seek(start_offset + shdr.offset)
-					data = f.read(phdr.filesz)
+					data = f.read(shdr.size)
 				else:
 					data = b''
 				self.sections.append(data)
@@ -555,6 +555,7 @@ class SignedElfFile(object):
 		self.app_version = kwargs['app_version'] if 'app_version' in kwargs and not kwargs['app_version'] is None else 0
 		self.fw_version = kwargs['fw_version'] if 'fw_version' in kwargs and not kwargs['fw_version'] is None else 0
 		self.auth_info = kwargs['auth_info'] if 'auth_info' in kwargs and not kwargs['auth_info'] is None else None
+		self.content_id = kwargs.get('content_id')
 
 	def _derive_paid(self):
 		is_exec = self.elf.ehdr.type in [
@@ -612,7 +613,8 @@ class SignedElfFile(object):
 
 		if SignedElfFile.HAS_NPDRM:
 			self.npdrm_control_block = SignedElfNpdrmControlBlock()
-			self.npdrm_control_block.content_id = b'\0' * SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE
+			self.npdrm_control_block.content_id = (self.content_id if self.content_id is not None
+				else b'\0' * SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE)
 			self.npdrm_control_block.random_pad = b'\0' * SELF_NPDRM_CONTROL_BLOCK_RANDOM_PAD_SIZE
 
 		self.header_size = struct.calcsize(SignedElfFile.COMMON_HEADER_FMT) + struct.calcsize(SignedElfFile.EXT_HEADER_FMT)
@@ -766,6 +768,16 @@ def auth_info_type(val):
 		raise argparse.ArgumentTypeError('invalid auth info: {0}'.format(val))
 	return new_val
 
+
+def content_id_type(val):
+	try:
+		prefix = val.encode('ascii')
+	except UnicodeEncodeError as err:
+		raise argparse.ArgumentTypeError('content ID prefix must be ASCII') from err
+	if len(prefix) != SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE or any(c < 0x21 or c > 0x7E for c in prefix):
+		raise argparse.ArgumentTypeError('content ID prefix must be exactly 19 printable ASCII bytes')
+	return prefix
+
 class MyParser(argparse.ArgumentParser):
 	def error(self, message):
 		self.print_help()
@@ -787,7 +799,17 @@ def read_exact(f, size, what='data'):
 def has_fself_magic(file_path):
 	try:
 		with open(file_path, 'rb') as f:
-			return f.read(len(FSELF_MAGIC)) in [FSELF_MAGIC, LEGACY_FSELF_MAGIC]
+			header = f.read(struct.calcsize(SignedElfFile.COMMON_HEADER_FMT) +
+				struct.calcsize(SignedElfFile.EXT_HEADER_FMT))
+			if len(header) < 0x20:
+				return False
+			magic, version, mode, endian, attribs = struct.unpack_from(
+				SignedElfFile.COMMON_HEADER_FMT, header)
+			key_type = struct.unpack_from('<I', header, 8)[0]
+			return (magic in (FSELF_MAGIC, LEGACY_FSELF_MAGIC) and
+				(version, mode, endian, attribs, key_type) ==
+				(SignedElfFile.VERSION, SignedElfFile.MODE, SignedElfFile.ENDIAN,
+				 SignedElfFile.ATTRIBS, SignedElfFile.KEY_TYPE))
 	except OSError:
 		return False
 
@@ -804,7 +826,7 @@ def load_elf_file(file_path):
 		elf_file.load(f)
 	return elf_file
 
-def save_fself_file(elf_file, file_path, paid, ptype, app_version, fw_version, auth_info):
+def save_fself_file(elf_file, file_path, paid, ptype, app_version, fw_version, auth_info, content_id=None):
 	with open(file_path, 'wb') as f:
 		self_file = SignedElfFile(
 			elf_file,
@@ -813,6 +835,7 @@ def save_fself_file(elf_file, file_path, paid, ptype, app_version, fw_version, a
 			app_version=app_version,
 			fw_version=fw_version,
 			auth_info=auth_info,
+			content_id=content_id,
 		)
 		self_file.save(f)
 
@@ -842,6 +865,8 @@ def is_complete_sceversion(records):
 
 
 def get_fself_repair_plan(file_path):
+	if not has_fself_magic(file_path):
+		return None
 	actual_size = os.path.getsize(file_path)
 	if actual_size < 0x20:
 		return None
@@ -868,28 +893,55 @@ def get_fself_repair_plan(file_path):
 	return (rewrite_magic, actual_size, 0) if rewrite_magic else None
 
 
-def repair_fself_file(input_path, output_path):
+def fself_content_id_offset(file_path):
+	if not has_fself_magic(file_path):
+		raise ValueError('input is not a supported FSELF')
+	with open(file_path, 'rb') as f:
+		f.seek(0xC)
+		header_size = struct.unpack('<H', read_exact(f, 2, 'SELF header size'))[0]
+		block_size = struct.calcsize(SignedElfNpdrmControlBlock.FMT)
+		if header_size < block_size or header_size > os.path.getsize(file_path):
+			raise ValueError('invalid SELF header size')
+		f.seek(header_size - block_size)
+		block_type = struct.unpack('<H', read_exact(f, 2, 'NPDRM control block type'))[0]
+		if block_type != SELF_CONTROL_BLOCK_TYPE_NPDRM:
+			raise ValueError('NPDRM control block is missing')
+	return header_size - block_size + 0x10
+
+
+def read_fself_content_id(file_path):
+	with open(file_path, 'rb') as f:
+		f.seek(fself_content_id_offset(file_path))
+		return read_exact(f, SELF_NPDRM_CONTROL_BLOCK_CONTENT_ID_SIZE, 'content ID prefix')
+
+
+def repair_fself_file(input_path, output_path, content_id=None):
 	plan = get_fself_repair_plan(input_path)
 	if plan is None:
 		shutil.copyfile(input_path, output_path)
-		return False
-	rewrite_magic, trailer_offset, padding = plan
-	with open(input_path, 'rb') as source, open(output_path, 'wb') as destination:
-		remaining = trailer_offset
-		position = 0
-		while remaining:
-			block = source.read(min(1 << 20, remaining))
-			if not block:
-				raise ValueError('unexpected EOF while repairing SELF')
-			if rewrite_magic and position == 0:
-				block = FSELF_MAGIC + block[4:]
-			destination.write(block)
-			position += len(block)
-			remaining -= len(block)
-		if padding:
-			destination.write(b'\0' * padding)
-		shutil.copyfileobj(source, destination, length=1 << 20)
-	return True
+	else:
+		rewrite_magic, trailer_offset, padding = plan
+		with open(input_path, 'rb') as source, open(output_path, 'wb') as destination:
+			remaining = trailer_offset
+			position = 0
+			while remaining:
+				block = source.read(min(1 << 20, remaining))
+				if not block:
+					raise ValueError('unexpected EOF while repairing SELF')
+				if rewrite_magic and position == 0:
+					block = FSELF_MAGIC + block[4:]
+				destination.write(block)
+				position += len(block)
+				remaining -= len(block)
+			if padding:
+				destination.write(b'\0' * padding)
+			shutil.copyfileobj(source, destination, length=1 << 20)
+	if content_id is not None and read_fself_content_id(output_path) != content_id:
+		with open(output_path, 'r+b') as f:
+			f.seek(fself_content_id_offset(output_path))
+			f.write(content_id)
+		return True
+	return plan is not None
 
 def unpack_fself_file(fself_path, elf_path):
 	common_size = struct.calcsize(SignedElfFile.COMMON_HEADER_FMT)
@@ -907,13 +959,17 @@ def unpack_fself_file(fself_path, elf_path):
 		)
 		if magic not in [SignedElfFile.MAGIC, SignedElfFile.LEGACY_MAGIC]:
 			raise ValueError('invalid SELF magic')
-		if endian != SignedElfFile.ENDIAN:
-			raise ValueError('unsupported SELF endian: 0x{0:02X}'.format(endian))
+		if (version, mode, endian, attribs) != (
+			SignedElfFile.VERSION, SignedElfFile.MODE,
+			SignedElfFile.ENDIAN, SignedElfFile.ATTRIBS):
+			raise ValueError('not a supported fake SELF header')
 
 		key_type, header_size, meta_size, declared_file_size, num_entries, flags = struct.unpack(
 			SignedElfFile.EXT_HEADER_FMT,
 			read_exact(f, ext_size, 'SELF extended header'),
 		)
+		if key_type != SignedElfFile.KEY_TYPE:
+			raise ValueError('not a supported fake SELF key type')
 
 		entries_end = common_size + ext_size + num_entries * entry_size
 		if entries_end > actual_size:
@@ -1017,7 +1073,7 @@ def unpack_fself_file(fself_path, elf_path):
 
 	return len(restored_segments), len(phdrs), len(output)
 
-def sign_directory(directory, paid, ptype, app_version, fw_version, auth_info):
+def sign_directory(directory, paid, ptype, app_version, fw_version, auth_info, content_id=None):
 	candidates = []
 	for root, _, files in os.walk(directory):
 		for name in files:
@@ -1035,10 +1091,10 @@ def sign_directory(directory, paid, ptype, app_version, fw_version, auth_info):
 		is_fself = has_fself_magic(file_path)
 		repair_plan = get_fself_repair_plan(file_path) if is_fself else None
 		if not is_elf and not is_fself:
-			print('skipping (not ELF/SELF): {0}'.format(file_path))
+			print('skipping (not ELF or supported FSELF): {0}'.format(file_path))
 			skipped += 1
 			continue
-		if is_fself and repair_plan is None:
+		if is_fself and repair_plan is None and (content_id is None or read_fself_content_id(file_path) == content_id):
 			print('skipping (SELF header already canonical): {0}'.format(file_path))
 			skipped += 1
 			continue
@@ -1062,10 +1118,10 @@ def sign_directory(directory, paid, ptype, app_version, fw_version, auth_info):
 			if is_elf:
 				print('signing: {0}'.format(file_path))
 				elf_file = load_elf_file(file_path)
-				save_fself_file(elf_file, temp_path, paid, ptype, app_version, fw_version, auth_info)
+				save_fself_file(elf_file, temp_path, paid, ptype, app_version, fw_version, auth_info, content_id)
 			else:
 				print('repairing SELF header: {0}'.format(file_path))
-				repair_fself_file(file_path, temp_path)
+				repair_fself_file(file_path, temp_path, content_id)
 
 			os.replace(file_path, backup_path)
 			try:
@@ -1169,6 +1225,7 @@ if __name__ == '__main__':
     parser.add_argument('--app-version', type=int_with_base_type, default=0, help='application version')
     parser.add_argument('--fw-version', type=int_with_base_type, default=0, help='firmware version')
     parser.add_argument('--auth-info', type=auth_info_type, default=None, help='authentication info')
+    parser.add_argument('--content-id', type=content_id_type, default=None, help='19-byte ASCII NPDRM Content ID prefix')
 
     if len(sys.argv) == 1:
         parser.print_usage()
@@ -1213,6 +1270,8 @@ if __name__ == '__main__':
     fself_file_path = args.output
 
     if args.unpack:
+        if args.content_id is not None:
+            parser.error('--content-id is only used when creating or repairing FSELF')
         if os.path.isdir(elf_file_path):
             if fself_file_path is not None:
                 parser.error('output path is not allowed in directory unpack mode')
@@ -1237,7 +1296,7 @@ if __name__ == '__main__':
     if os.path.isdir(elf_file_path):
         if fself_file_path is not None:
             parser.error('output path is not allowed in directory mode')
-        success = sign_directory(elf_file_path, paid, ptype, app_version, fw_version, auth_info)
+        success = sign_directory(elf_file_path, paid, ptype, app_version, fw_version, auth_info, args.content_id)
         sys.exit(0 if success else 1)
 
     if fself_file_path is None:
@@ -1248,7 +1307,7 @@ if __name__ == '__main__':
     if has_fself_magic(elf_file_path):
         print('repairing fake signed elf file: {0}'.format(elf_file_path))
         try:
-            changed = repair_fself_file(elf_file_path, fself_file_path)
+            changed = repair_fself_file(elf_file_path, fself_file_path, args.content_id)
         except Exception as err:
             traceback.print_exc()
             print('')
@@ -1270,7 +1329,7 @@ if __name__ == '__main__':
 
     print('saving fake signed elf file: {0}'.format(fself_file_path))
     try:
-        save_fself_file(elf_file, fself_file_path, paid, ptype, app_version, fw_version, auth_info)
+        save_fself_file(elf_file, fself_file_path, paid, ptype, app_version, fw_version, auth_info, args.content_id)
     except Exception as err:
         traceback.print_exc()
         print('')
